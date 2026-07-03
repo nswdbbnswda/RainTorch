@@ -1,14 +1,12 @@
-#ifndef NODE_H
-#define NODE_H
+#pragma once
 
 #include <vector>
 #include <functional>
 #include <string>
-#include <memory>  // 必须包含这个头文件
+#include <memory>
 
 namespace raintorch {
 
-// 加上 std:: 命名空间
 struct Node : std::enable_shared_from_this<Node> {
     double data;
     double grad;
@@ -30,5 +28,3 @@ private:
 using NodePtr = std::shared_ptr<Node>;
 
 } // namespace raintorch
-
-#endif
