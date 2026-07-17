@@ -185,8 +185,20 @@ struct Module {
   virtual Var forward(Var x) = 0;
 
   virtual std::vector<Var> parameters() {
-    return {}; 
+    std::vector<Var> res;
+    for (auto& m : subs) {
+      auto p = m->parameters();
+      res.insert(res.end(), p.begin(), p.end());
+    }
+    return res;
   }
+
+  void register_submodule(std::shared_ptr<Module> sub) {
+    subs.push_back(sub);
+  }
+
+private:
+  std::vector<std::shared_ptr<Module>> subs;
 };
 
 struct Linear : Module {
@@ -206,6 +218,23 @@ struct Linear : Module {
   virtual std::vector<Var> parameters() override {
     return {w, b};
   }
+};
+
+struct TwoLayerNet : Module {
+    std::shared_ptr<Linear> fc1, fc2;
+    TwoLayerNet() {
+        fc1 = std::make_shared<Linear>(1, 4);
+        fc2 = std::make_shared<Linear>(4, 1);
+        register_submodule(fc1);
+        register_submodule(fc2);
+    }
+
+    Var forward(Var x) override {
+        x = fc1->forward(x);
+        x = relu(x);
+        x = fc2->forward(x);
+        return x;
+    }
 };
 
 
