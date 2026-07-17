@@ -5,6 +5,7 @@
 #include <memory>
 #include <unordered_set>
 
+
 struct Node {
     double val;
     double grad;
@@ -17,9 +18,27 @@ struct Node {
 
 using Var = std::shared_ptr<Node>;
 
+
 Var create(double val, bool requires_grad=true) {
     return std::make_shared<Node>(val, requires_grad);
 }
+
+struct SGD {
+  double lr;
+  std::vector<Var> params;
+  SGD(double lr, const std::vector<Var>& params) : lr(lr), params(params) {}
+  void step() {
+    for (auto& v : params) {
+      v->val = v->val - lr * v->grad;
+    }
+  }
+
+  void zero_grad() {
+    for (auto& v : params) {
+      v->grad = 0;
+    }
+  }
+};
 
 void build_topo(Var node, std::vector<Var>& topo, std::unordered_set<Node*>& visited) {
     if (!node) return;
@@ -48,15 +67,6 @@ void backward(Var out, std::vector<Var>& topo) {
         n->grad_fn();
       }
     }
-}
-
-// 【修复】只清空梯度，不破坏计算图结构
-void zero_grad(std::vector<Var>& topo_nodes) {
-  for (auto& v : topo_nodes) {
-    if (v) {
-      v->grad = 0.0;
-    }
-  }
 }
 
 // 四则算子
@@ -120,11 +130,14 @@ int main() {
     // 可训练参数
     Var w = create(0.0);
     Var b = create(0.0);
-
     double lr = 0.01;
+    std::vector<Var> params{w, b};
+    SGD sgd(lr, params);
+
     int epochs = 1000;
 
     for (int epoch = 0; epoch < epochs; epoch++) {
+        sgd.zero_grad();
         Var total_loss = create(0.0, false);
         std::vector<Var> topo_nodes;
         for (int i = 0; i < xs.size(); i++) {
@@ -141,15 +154,8 @@ int main() {
         }
 
         backward(total_loss, topo_nodes);
-
-        std::vector<Var> params{w, b};
         // SGD 更新
-        for (auto& param : params) {
-          param->val = param->val - lr * param->grad;
-        }
-
-        // 仅梯度置零，保留节点结构
-        zero_grad(topo_nodes);
+        sgd.step();
 
         if (epoch % 50 == 0) {
             std::cout << "Epoch " << epoch
