@@ -6,6 +6,7 @@
 #include <unordered_set>
 
 
+
 struct Node {
     double val;
     double grad;
@@ -39,6 +40,7 @@ struct SGD {
     }
   }
 };
+
 
 void build_topo(Var node, std::vector<Var>& topo, std::unordered_set<Node*>& visited) {
     if (!node) return;
@@ -169,6 +171,37 @@ Var square(Var x) {
     }
     return res;
 }
+
+struct Module {
+  virtual ~Module() = default;
+
+  // 前向传播算子, 子类必须实现
+  virtual Var forward(Var x) = 0;
+
+  virtual std::vector<Var> parameters() {
+    return {}; 
+  }
+};
+
+struct Linear : Module {
+  Var w;
+  Var b;
+
+  Linear(int in_dim, int out_dim) {
+    // 权重偏置默认开启梯度, 可训练
+    w = create(0);
+    b = create(0);
+  }
+
+  virtual Var forward(Var x) override {
+    return w * x + b;
+  }
+
+  virtual std::vector<Var> parameters() override {
+    return {w, b};
+  }
+};
+
 
 int main() {
     // 构造数据集 y = 3*x + 4
