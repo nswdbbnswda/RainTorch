@@ -109,6 +109,54 @@ Var operator-(Var a, Var b) {
     return res;
 }
 
+Var operator/(Var a, Var b) {
+    bool need_grad = a->requires_grad || b->requires_grad;
+    Var res = create(a->val / b->val, need_grad);
+    res->parents = {a, b};
+    if (need_grad) {
+        res->grad_fn = [a, b, res](){
+            a->grad += res->grad / b->val;
+            b->grad -= res->grad * a->val / (b->val * b->val);
+        };
+    }
+    return res;
+}
+
+// 一元负号 -Var
+Var operator-(Var x) {
+    bool need_grad = x->requires_grad;
+    Var res = create(-x->val, need_grad);
+    res->parents = {x};
+    if (need_grad) {
+        res->grad_fn = [x, res](){
+            x->grad -= res->grad;
+        };
+    }
+    return res;
+}
+
+// ReLU
+Var relu(Var x) {
+    bool need_grad = x->requires_grad;
+    double out = x->val > 0 ? x->val : 0.0;
+    Var res = create(out, need_grad);
+    res->parents = {x};
+    if (need_grad) {
+        res->grad_fn = [x, res](){
+            if (x->val > 0) {
+                x->grad += res->grad;
+            }
+        };
+    }
+    return res;
+}
+
+// 求和
+Var sum(Var x) {
+    // 当前标量版本sum就是自身，后续向量版再改写
+    return x;
+}
+
 // 平方，用于损失函数
 Var square(Var x) {
     bool need_grad = x->requires_grad;
