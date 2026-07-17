@@ -5,23 +5,21 @@
 #include <memory>
 #include <unordered_set>
 
-
-
 struct Node {
     double val;
     double grad;
     std::vector<std::shared_ptr<Node>> parents;
     std::function<void()> grad_fn;
     bool requires_grad;
-
-    Node(double v, bool requires_grad=true) : val(v), grad(0.0), requires_grad(requires_grad) {}
+    bool is_leaf;
+    Node(double v, bool requires_grad=true, bool is_leaf=false) : val(v), grad(0.0), requires_grad(requires_grad), is_leaf(is_leaf) {}
 };
 
 using Var = std::shared_ptr<Node>;
 
 
-Var create(double val, bool requires_grad=true) {
-    return std::make_shared<Node>(val, requires_grad);
+Var create(double val, bool requires_grad=true, bool is_leaf=false) {
+    return std::make_shared<Node>(val, requires_grad, is_leaf);
 }
 
 struct SGD {
@@ -36,11 +34,12 @@ struct SGD {
 
   void zero_grad() {
     for (auto& v : params) {
-      v->grad = 0;
+      if (v->is_leaf) {
+        v->grad = 0;
+      }
     }
   }
 };
-
 
 void build_topo(Var node, std::vector<Var>& topo, std::unordered_set<Node*>& visited) {
     if (!node) return;
@@ -68,6 +67,13 @@ void backward(Var out, std::vector<Var>& topo) {
       if (n->grad_fn) {
         n->grad_fn();
       }
+    }
+
+    // 新增：非叶子节点梯度直接置0，节省内存
+    for (auto& n : topo) {
+        if (!n->is_leaf) {
+            n->grad = 0.0;
+        }
     }
 }
 
@@ -189,8 +195,8 @@ struct Linear : Module {
 
   Linear(int in_dim, int out_dim) {
     // 权重偏置默认开启梯度, 可训练
-    w = create(0);
-    b = create(0);
+    w = create(0, true, true);
+    b = create(0, true, true);
   }
 
   virtual Var forward(Var x) override {
@@ -208,11 +214,9 @@ int main() {
     std::vector<double> xs = {1, 2, 3, 4, 5};
     std::vector<double> ys = {7, 10, 13, 16, 19};
 
-    // 可训练参数
-    Var w = create(0.0);
-    Var b = create(0.0);
+    Linear model(1, 1);
+    std::vector<Var> params = model.parameters();
     double lr = 0.01;
-    std::vector<Var> params{w, b};
     SGD sgd(lr, params);
 
     int epochs = 1000;
@@ -228,27 +232,26 @@ int main() {
             Var x = create(xi, false);
             Var y_true = create(yi_true, false);
 
-            Var y_pred = w * x + b;
+            Var y_pred = model.forward(x);
             Var loss = square(y_pred - y_true);
 
             total_loss = total_loss + loss;
         }
 
         backward(total_loss, topo_nodes);
-        // SGD 更新
         sgd.step();
 
         if (epoch % 50 == 0) {
             std::cout << "Epoch " << epoch
-                      << " | w=" << w->val
-                      << " | b=" << b->val
+                      << " | w=" << model.w->val
+                      << " | b=" << model.b->val
                       << " | total_loss=" << total_loss->val << "\n";
         }
     }
 
     std::cout << "\n训练完成！\n";
-    std::cout << "拟合得到 w ≈ " << w->val << "\n";
-    std::cout << "拟合得到 b ≈ " << b->val << "\n";
+    std::cout << "拟合得到 w ≈ " << model.w->val << "\n";
+    std::cout << "拟合得到 b ≈ " << model.b->val << "\n";
     std::cout << "理论真值 w=3, b=4\n";
     return 0;
 }
