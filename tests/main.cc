@@ -360,6 +360,54 @@ Var sum(Var x) {
     return res;
 }
 
+Var softmax(Var x) {
+    if (x->shape.size() != 1) {
+        throw std::runtime_error("softmax only support 1D vector now");
+    }
+    bool need_grad = x->requires_grad;
+    int n = numel(x->shape);
+    std::vector<double> exp_x(n);
+    double sum_exp = 0.0;
+
+    // 前向：exp(x)
+    for (int i = 0; i < n; i++) {
+        exp_x[i] = std::exp(x->data[i]);
+        sum_exp += exp_x[i];
+    }
+    std::vector<double> out_data(n);
+    for (int i = 0; i < n; i++) {
+        out_data[i] = exp_x[i] / sum_exp;
+    }
+
+    Var res = create(out_data, x->shape, need_grad);
+    res->parents = {x};
+    if (need_grad) {
+        res->grad_fn = [x, res, n]() {
+            // dxi = sum_{j} res.grad[j] * res.data[i] * (delta_ij - res.data[j])
+            std::vector<double> dx(n, 0.0);
+            for (int i = 0; i < n; i++) {
+                double si = res->data[i];
+                double g = 0.0;
+                for (int j = 0; j < n; j++) {
+                    double sj = res->data[j];
+                    double dout_j = res->grad[j];
+                    if (i == j) {
+                        g += dout_j * si * (1.0 - sj);
+                    } else {
+                        g -= dout_j * si * sj;
+                    }
+                }
+                dx[i] = g;
+            }
+            // 梯度累加至输入x
+            for (int i = 0; i < n; i++) {
+                x->grad[i] += dx[i];
+            }
+        };
+    }
+    return res;
+}
+
 // ===================== 矩阵转置 =====================
 Var transpose(Var x) {
     if (x->shape.size() != 2) throw std::runtime_error("transpose only support 2D");
