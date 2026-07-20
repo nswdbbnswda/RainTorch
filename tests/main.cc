@@ -4,140 +4,291 @@
 #include <algorithm>
 #include <memory>
 #include <unordered_set>
+#include <stdexcept>
 
+// ===================== 工具函数 =====================
+inline int numel(const std::vector<int>& shape) {
+    int cnt = 1;
+    for (int d : shape) cnt *= d;
+    return cnt;
+}
+
+std::vector<int> broadcast_shape(const std::vector<int>& a, const std::vector<int>& b) {
+    std::vector<int> res;
+    int i = (int)a.size() - 1, j = (int)b.size() - 1;
+    while (i >= 0 || j >= 0) {
+        int da = (i >= 0) ? a[i] : 1;
+        int db = (j >= 0) ? b[j] : 1;
+        if (da != 1 && db != 1 && da != db) {
+            throw std::runtime_error("broadcast failed: shape mismatch");
+        }
+        res.push_back(std::max(da, db));
+        i--; j--;
+    }
+    std::reverse(res.begin(), res.end());
+    return res;
+}
+
+int coord2offset(const std::vector<int>& coord, const std::vector<int>& shape) {
+    int off = 0;
+    int stride = 1;
+    for (int i = (int)shape.size() - 1; i >= 0; --i) {
+        off += coord[i] * stride;
+        stride *= shape[i];
+    }
+    return off;
+}
+
+int broadcast_offset(const std::vector<int>& out_coord,
+                     const std::vector<int>& out_shape,
+                     const std::vector<int>& in_shape) {
+    std::vector<int> in_coord(in_shape.size(), 0);
+    int diff = (int)out_shape.size() - (int)in_shape.size();
+    for (int i = 0; i < (int)in_shape.size(); ++i) {
+        int out_dim_idx = diff + i;
+        int out_c = out_coord[out_dim_idx];
+        int in_d = in_shape[i];
+        in_coord[i] = (in_d == 1) ? 0 : out_c;
+    }
+    return coord2offset(in_coord, in_shape);
+}
+
+// ===================== Node 张量节点 =====================
 struct Node {
-    double val;
-    double grad;
+    std::vector<double> data;
+    std::vector<double> grad;
+    std::vector<int> shape;
     std::vector<std::shared_ptr<Node>> parents;
     std::function<void()> grad_fn;
     bool requires_grad;
     bool is_leaf;
-    Node(double v, bool requires_grad=true, bool is_leaf=false) : val(v), grad(0.0), requires_grad(requires_grad), is_leaf(is_leaf) {}
-};
 
+    Node(std::vector<double> d, std::vector<int> shp, bool req_grad = true, bool leaf = false)
+        : data(std::move(d)), shape(std::move(shp)), requires_grad(req_grad), is_leaf(leaf)
+    {
+        int n = numel(shape);
+        grad.assign(n, 0.0);
+    }
+};
 using Var = std::shared_ptr<Node>;
 
-
-Var create(double val, bool requires_grad=true, bool is_leaf=false) {
-    return std::make_shared<Node>(val, requires_grad, is_leaf);
+// 创建张量
+Var create(std::vector<double> data, std::vector<int> shape, bool requires_grad = true, bool is_leaf = false) {
+    return std::make_shared<Node>(std::move(data), std::move(shape), requires_grad, is_leaf);
+}
+Var create(double val, bool requires_grad = true, bool is_leaf = false) {
+    return create({val}, {1}, requires_grad, is_leaf);
 }
 
-struct SGD {
-  double lr;
-  std::vector<Var> params;
-  SGD(double lr, const std::vector<Var>& params) : lr(lr), params(params) {}
-  void step() {
-    for (auto& v : params) {
-      v->val = v->val - lr * v->grad;
-    }
-  }
-
-  void zero_grad() {
-    for (auto& v : params) {
-      if (v->is_leaf) {
-        v->grad = 0;
-      }
-    }
-  }
-};
-
+// ===================== 自动微分拓扑 & 反向传播 =====================
 void build_topo(Var node, std::vector<Var>& topo, std::unordered_set<Node*>& visited) {
     if (!node) return;
     Node* raw = node.get();
     if (visited.count(raw)) return;
     visited.insert(raw);
-
     for (auto& p : node->parents) {
         build_topo(p, topo, visited);
     }
     if (node->requires_grad) {
-      topo.push_back(node);
+        topo.push_back(node);
     }
 }
 
-void backward(Var out, std::vector<Var>& topo) {
-    if (!out) return;
-    out->grad = 1.0;
-
+void backward(Var out) {
+    std::vector<Var> topo;
     std::unordered_set<Node*> visited;
     build_topo(out, topo, visited);
-
+    // 输出梯度置1
+    std::fill(out->grad.begin(), out->grad.end(), 1.0);
+    // 逆序执行梯度函数
     std::reverse(topo.begin(), topo.end());
     for (auto& n : topo) {
-      if (n->grad_fn) {
-        n->grad_fn();
-      }
+        if (n->grad_fn) n->grad_fn();
     }
-
-    // 新增：非叶子节点梯度直接置0，节省内存
+    // 清空非叶子梯度
     for (auto& n : topo) {
         if (!n->is_leaf) {
-            n->grad = 0.0;
+            std::fill(n->grad.begin(), n->grad.end(), 0.0);
         }
     }
 }
 
-// 四则算子
+// ===================== 多维广播四则算子 =====================
 Var operator+(Var a, Var b) {
     bool need_grad = a->requires_grad || b->requires_grad;
-    Var res = create(a->val + b->val, need_grad);
+    std::vector<int> out_shape = broadcast_shape(a->shape, b->shape);
+    int out_n = numel(out_shape);
+    std::vector<double> out_data(out_n, 0.0);
+    std::vector<int> coord(out_shape.size(), 0);
+
+    for (int idx = 0; idx < out_n; ++idx) {
+        int tmp = idx;
+        for (int d = (int)out_shape.size() - 1; d >= 0; --d) {
+            coord[d] = tmp % out_shape[d];
+            tmp /= out_shape[d];
+        }
+        int off_a = broadcast_offset(coord, out_shape, a->shape);
+        int off_b = broadcast_offset(coord, out_shape, b->shape);
+        out_data[idx] = a->data[off_a] + b->data[off_b];
+    }
+    Var res = create(out_data, out_shape, need_grad);
     res->parents = {a, b};
     if (need_grad) {
-      res->grad_fn = [a, b, res]() {
-          a->grad += res->grad;
-          b->grad += res->grad;
-      };
+        res->grad_fn = [a, b, res, out_shape]() {
+            int n = numel(out_shape);
+            std::vector<int> coord(out_shape.size(), 0);
+            for (int idx = 0; idx < n; ++idx) {
+                int tmp = idx;
+                for (int d = (int)out_shape.size() - 1; d >= 0; --d) {
+                    coord[d] = tmp % out_shape[d];
+                    tmp /= out_shape[d];
+                }
+                double dout = res->grad[idx];
+                int off_a = broadcast_offset(coord, out_shape, a->shape);
+                int off_b = broadcast_offset(coord, out_shape, b->shape);
+                a->grad[off_a] += dout;
+                b->grad[off_b] += dout;
+            }
+        };
     }
     return res;
 }
 
 Var operator*(Var a, Var b) {
     bool need_grad = a->requires_grad || b->requires_grad;
-    Var res = create(a->val * b->val, need_grad);
+    std::vector<int> out_shape = broadcast_shape(a->shape, b->shape);
+    int out_n = numel(out_shape);
+    std::vector<double> out_data(out_n, 0.0);
+    std::vector<int> coord(out_shape.size(), 0);
+
+    for (int idx = 0; idx < out_n; ++idx) {
+        int tmp = idx;
+        for (int d = (int)out_shape.size() - 1; d >= 0; --d) {
+            coord[d] = tmp % out_shape[d];
+            tmp /= out_shape[d];
+        }
+        int off_a = broadcast_offset(coord, out_shape, a->shape);
+        int off_b = broadcast_offset(coord, out_shape, b->shape);
+        out_data[idx] = a->data[off_a] * b->data[off_b];
+    }
+    Var res = create(out_data, out_shape, need_grad);
     res->parents = {a, b};
     if (need_grad) {
-      res->grad_fn = [a, b, res]() {
-        a->grad += res->grad * b->val;
-        b->grad += res->grad * a->val;
-      };
+        res->grad_fn = [a, b, res, out_shape]() {
+            int n = numel(out_shape);
+            std::vector<int> coord(out_shape.size(), 0);
+            for (int idx = 0; idx < n; ++idx) {
+                int tmp = idx;
+                for (int d = (int)out_shape.size() - 1; d >= 0; --d) {
+                    coord[d] = tmp % out_shape[d];
+                    tmp /= out_shape[d];
+                }
+                double dout = res->grad[idx];
+                int off_a = broadcast_offset(coord, out_shape, a->shape);
+                int off_b = broadcast_offset(coord, out_shape, b->shape);
+                a->grad[off_a] += dout * b->data[off_b];
+                b->grad[off_b] += dout * a->data[off_a];
+            }
+        };
     }
     return res;
 }
 
 Var operator-(Var a, Var b) {
-    bool need_grad = a->requires_grad || b->requires_grad; 
-    Var res = create(a->val - b->val, need_grad);
+    bool need_grad = a->requires_grad || b->requires_grad;
+    std::vector<int> out_shape = broadcast_shape(a->shape, b->shape);
+    int out_n = numel(out_shape);
+    std::vector<double> out_data(out_n, 0.0);
+    std::vector<int> coord(out_shape.size(), 0);
+
+    for (int idx = 0; idx < out_n; ++idx) {
+        int tmp = idx;
+        for (int d = (int)out_shape.size() - 1; d >= 0; --d) {
+            coord[d] = tmp % out_shape[d];
+            tmp /= out_shape[d];
+        }
+        int off_a = broadcast_offset(coord, out_shape, a->shape);
+        int off_b = broadcast_offset(coord, out_shape, b->shape);
+        out_data[idx] = a->data[off_a] - b->data[off_b];
+    }
+    Var res = create(out_data, out_shape, need_grad);
     res->parents = {a, b};
     if (need_grad) {
-      res->grad_fn = [a, b, res](){
-          a->grad += res->grad;
-          b->grad -= res->grad;
-      };
+        res->grad_fn = [a, b, res, out_shape]() {
+            int n = numel(out_shape);
+            std::vector<int> coord(out_shape.size(), 0);
+            for (int idx = 0; idx < n; ++idx) {
+                int tmp = idx;
+                for (int d = (int)out_shape.size() - 1; d >= 0; --d) {
+                    coord[d] = tmp % out_shape[d];
+                    tmp /= out_shape[d];
+                }
+                double dout = res->grad[idx];
+                int off_a = broadcast_offset(coord, out_shape, a->shape);
+                int off_b = broadcast_offset(coord, out_shape, b->shape);
+                a->grad[off_a] += dout;
+                b->grad[off_b] -= dout;
+            }
+        };
     }
     return res;
 }
 
 Var operator/(Var a, Var b) {
     bool need_grad = a->requires_grad || b->requires_grad;
-    Var res = create(a->val / b->val, need_grad);
+    std::vector<int> out_shape = broadcast_shape(a->shape, b->shape);
+    int out_n = numel(out_shape);
+    std::vector<double> out_data(out_n, 0.0);
+    std::vector<int> coord(out_shape.size(), 0);
+
+    for (int idx = 0; idx < out_n; ++idx) {
+        int tmp = idx;
+        for (int d = (int)out_shape.size() - 1; d >= 0; --d) {
+            coord[d] = tmp % out_shape[d];
+            tmp /= out_shape[d];
+        }
+        int off_a = broadcast_offset(coord, out_shape, a->shape);
+        int off_b = broadcast_offset(coord, out_shape, b->shape);
+        out_data[idx] = a->data[off_a] / b->data[off_b];
+    }
+    Var res = create(out_data, out_shape, need_grad);
     res->parents = {a, b};
     if (need_grad) {
-        res->grad_fn = [a, b, res](){
-            a->grad += res->grad / b->val;
-            b->grad -= res->grad * a->val / (b->val * b->val);
+        res->grad_fn = [a, b, res, out_shape]() {
+            int n = numel(out_shape);
+            std::vector<int> coord(out_shape.size(), 0);
+            for (int idx = 0; idx < n; ++idx) {
+                int tmp = idx;
+                for (int d = (int)out_shape.size() - 1; d >= 0; --d) {
+                    coord[d] = tmp % out_shape[d];
+                    tmp /= out_shape[d];
+                }
+                double dout = res->grad[idx];
+                int off_a = broadcast_offset(coord, out_shape, a->shape);
+                int off_b = broadcast_offset(coord, out_shape, b->shape);
+                double va = a->data[off_a];
+                double vb = b->data[off_b];
+                a->grad[off_a] += dout / vb;
+                b->grad[off_b] -= dout * va / (vb * vb);
+            }
         };
     }
     return res;
 }
 
-// 一元负号 -Var
 Var operator-(Var x) {
     bool need_grad = x->requires_grad;
-    Var res = create(-x->val, need_grad);
+    int n = numel(x->shape);
+    std::vector<double> out_data(n);
+    for (int i = 0; i < n; ++i) out_data[i] = -x->data[i];
+    Var res = create(out_data, x->shape, need_grad);
     res->parents = {x};
     if (need_grad) {
-        res->grad_fn = [x, res](){
-            x->grad -= res->grad;
+        res->grad_fn = [x, res]() {
+            int n = numel(res->shape);
+            for (int i = 0; i < n; ++i) {
+                x->grad[i] -= res->grad[i];
+            }
         };
     }
     return res;
@@ -146,80 +297,126 @@ Var operator-(Var x) {
 // ReLU
 Var relu(Var x) {
     bool need_grad = x->requires_grad;
-    double out = x->val > 0 ? x->val : 0.0;
-    Var res = create(out, need_grad);
+    int n = numel(x->shape);
+    std::vector<double> out_data(n);
+    for (int i = 0; i < n; ++i) {
+        out_data[i] = x->data[i] > 0 ? x->data[i] : 0.0;
+    }
+    Var res = create(out_data, x->shape, need_grad);
     res->parents = {x};
     if (need_grad) {
-        res->grad_fn = [x, res](){
-            if (x->val > 0) {
-                x->grad += res->grad;
+        res->grad_fn = [x, res]() {
+            int n = numel(res->shape);
+            for (int i = 0; i < n; ++i) {
+                if (x->data[i] > 0) {
+                    x->grad[i] += res->grad[i];
+                }
             }
         };
     }
     return res;
 }
 
-// 求和
-Var sum(Var x) {
-    // 当前标量版本sum就是自身，后续向量版再改写
-    return x;
-}
-
-// 平方，用于损失函数
+// 逐元素平方
 Var square(Var x) {
     bool need_grad = x->requires_grad;
-    Var res = create(x->val * x->val, need_grad);
+    int n = numel(x->shape);
+    std::vector<double> out_data(n);
+    for (int i = 0; i < n; ++i) {
+        out_data[i] = x->data[i] * x->data[i];
+    }
+    Var res = create(out_data, x->shape, need_grad);
     res->parents = {x};
     if (need_grad) {
-      res->grad_fn = [x, res](){
-        x->grad += res->grad * 2 * x->val;
-      };
+        res->grad_fn = [x, res]() {
+            int n = numel(res->shape);
+            for (int i = 0; i < n; ++i) {
+                x->grad[i] += res->grad[i] * 2 * x->data[i];
+            }
+        };
     }
     return res;
 }
 
-struct Module {
-  virtual ~Module() = default;
-
-  // 前向传播算子, 子类必须实现
-  virtual Var forward(Var x) = 0;
-
-  virtual std::vector<Var> parameters() {
-    std::vector<Var> res;
-    for (auto& m : subs) {
-      auto p = m->parameters();
-      res.insert(res.end(), p.begin(), p.end());
+// 求和所有元素
+Var sum(Var x) {
+    bool need_grad = x->requires_grad;
+    int n = numel(x->shape);
+    double s = 0.0;
+    for (double v : x->data) s += v;
+    Var res = create(s, need_grad);
+    res->parents = {x};
+    if (need_grad) {
+        res->grad_fn = [x, res]() {
+            double dout = res->grad[0];
+            int n = numel(x->shape);
+            for (int i = 0; i < n; ++i) {
+                x->grad[i] += dout;
+            }
+        };
     }
     return res;
-  }
+}
 
-  void register_submodule(std::shared_ptr<Module> sub) {
-    subs.push_back(sub);
-  }
+// ===================== SGD 优化器 =====================
+struct SGD {
+    double lr;
+    std::vector<Var> params;
+    SGD(double lr, const std::vector<Var>& params) : lr(lr), params(params) {}
 
+    void step() {
+        for (auto& v : params) {
+            int n = numel(v->shape);
+            for (int i = 0; i < n; ++i) {
+                v->data[i] -= lr * v->grad[i];
+            }
+        }
+    }
+    void zero_grad() {
+        for (auto& v : params) {
+            if (v->is_leaf) {
+                std::fill(v->grad.begin(), v->grad.end(), 0.0);
+            }
+        }
+    }
+};
+
+// ===================== Module 网络基类 =====================
+struct Module {
+    virtual ~Module() = default;
+    virtual Var forward(Var x) = 0;
+    virtual std::vector<Var> parameters() {
+        std::vector<Var> res;
+        for (auto& m : subs) {
+            auto p = m->parameters();
+            res.insert(res.end(), p.begin(), p.end());
+        }
+        return res;
+    }
+    void register_submodule(std::shared_ptr<Module> sub) {
+        subs.push_back(sub);
+    }
 private:
-  std::vector<std::shared_ptr<Module>> subs;
+    std::vector<std::shared_ptr<Module>> subs;
 };
 
+// 单层线性（仅标量版本，演示用；如需真正矩阵乘需补充matmul）
 struct Linear : Module {
-  Var w;
-  Var b;
-
-  Linear(int in_dim, int out_dim) {
-    // 权重偏置默认开启梯度, 可训练
-    w = create(0, true, true);
-    b = create(0, true, true);
-  }
-
-  virtual Var forward(Var x) override {
-    return w * x + b;
-  }
-
-  virtual std::vector<Var> parameters() override {
-    return {w, b};
-  }
+    Var w;
+    Var b;
+    Linear(int, int) {
+        w = create(0.0, true, true);
+        b = create(0.0, true, true);
+    }
+    Var forward(Var x) override {
+        return w * x + b;
+    }
+    std::vector<Var> parameters() override {
+        return {w, b};
+    }
 };
 
+// 两层网络
 struct TwoLayerNet : Module {
     std::shared_ptr<Linear> fc1, fc2;
     TwoLayerNet() {
@@ -228,7 +425,6 @@ struct TwoLayerNet : Module {
         register_submodule(fc1);
         register_submodule(fc2);
     }
-
     Var forward(Var x) override {
         x = fc1->forward(x);
         x = relu(x);
@@ -237,50 +433,41 @@ struct TwoLayerNet : Module {
     }
 };
 
-
+// ===================== 训练入口 =====================
 int main() {
-    // 构造数据集 y = 3*x + 4
+    // 数据集 y = 3x + 4
     std::vector<double> xs = {1, 2, 3, 4, 5};
     std::vector<double> ys = {7, 10, 13, 16, 19};
 
     Linear model(1, 1);
-    std::vector<Var> params = model.parameters();
-    double lr = 0.01;
-    SGD sgd(lr, params);
+    auto params = model.parameters();
+    SGD sgd(0.01, params);
 
     int epochs = 1000;
-
-    for (int epoch = 0; epoch < epochs; epoch++) {
+    for (int epoch = 0; epoch < epochs; ++epoch) {
         sgd.zero_grad();
         Var total_loss = create(0.0, false);
-        std::vector<Var> topo_nodes;
-        for (int i = 0; i < xs.size(); i++) {
-            double xi = xs[i];
-            double yi_true = ys[i];
 
-            Var x = create(xi, false);
-            Var y_true = create(yi_true, false);
-
-            Var y_pred = model.forward(x);
-            Var loss = square(y_pred - y_true);
-
+        for (int i = 0; i < (int)xs.size(); ++i) {
+            Var x = create(xs[i], false);
+            Var yt = create(ys[i], false);
+            Var yp = model.forward(x);
+            Var loss = square(yp - yt);
             total_loss = total_loss + loss;
         }
-
-        backward(total_loss, topo_nodes);
+        backward(total_loss);
         sgd.step();
 
         if (epoch % 50 == 0) {
             std::cout << "Epoch " << epoch
-                      << " | w=" << model.w->val
-                      << " | b=" << model.b->val
-                      << " | total_loss=" << total_loss->val << "\n";
+                      << " w=" << model.w->data[0]
+                      << " b=" << model.b->data[0]
+                      << " loss=" << total_loss->data[0] << "\n";
         }
     }
-
-    std::cout << "\n训练完成！\n";
-    std::cout << "拟合得到 w ≈ " << model.w->val << "\n";
-    std::cout << "拟合得到 b ≈ " << model.b->val << "\n";
-    std::cout << "理论真值 w=3, b=4\n";
+    std::cout << "\nTrain finish:\n";
+    std::cout << "w ≈ " << model.w->data[0] << "\n";
+    std::cout << "b ≈ " << model.b->data[0] << "\n";
+    std::cout << "Target w=3, b=4\n";
     return 0;
 }
