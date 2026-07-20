@@ -5,8 +5,14 @@
 #include <memory>
 #include <unordered_set>
 #include <stdexcept>
+#include <functional>
+#include <random>
 
-// ===================== 工具函数 =====================
+// 随机数初始化权重
+std::mt19937 rng(42);
+std::uniform_real_distribution<double> dist(-0.1, 0.1);
+
+// ===================== 张量工具函数 =====================
 inline int numel(const std::vector<int>& shape) {
     int cnt = 1;
     for (int d : shape) cnt *= d;
@@ -72,7 +78,7 @@ struct Node {
 };
 using Var = std::shared_ptr<Node>;
 
-// 创建张量
+// 创建张量接口
 Var create(std::vector<double> data, std::vector<int> shape, bool requires_grad = true, bool is_leaf = false) {
     return std::make_shared<Node>(std::move(data), std::move(shape), requires_grad, is_leaf);
 }
@@ -80,7 +86,7 @@ Var create(double val, bool requires_grad = true, bool is_leaf = false) {
     return create({val}, {1}, requires_grad, is_leaf);
 }
 
-// ===================== 自动微分拓扑 & 反向传播 =====================
+// ===================== 反向传播拓扑排序 =====================
 void build_topo(Var node, std::vector<Var>& topo, std::unordered_set<Node*>& visited) {
     if (!node) return;
     Node* raw = node.get();
@@ -98,14 +104,12 @@ void backward(Var out) {
     std::vector<Var> topo;
     std::unordered_set<Node*> visited;
     build_topo(out, topo, visited);
-    // 输出梯度置1
     std::fill(out->grad.begin(), out->grad.end(), 1.0);
-    // 逆序执行梯度函数
     std::reverse(topo.begin(), topo.end());
     for (auto& n : topo) {
         if (n->grad_fn) n->grad_fn();
     }
-    // 清空非叶子梯度
+    // 清空非叶子节点梯度节省内存
     for (auto& n : topo) {
         if (!n->is_leaf) {
             std::fill(n->grad.begin(), n->grad.end(), 0.0);
@@ -113,7 +117,7 @@ void backward(Var out) {
     }
 }
 
-// ===================== 多维广播四则算子 =====================
+// ===================== 广播四则运算符 =====================
 Var operator+(Var a, Var b) {
     bool need_grad = a->requires_grad || b->requires_grad;
     std::vector<int> out_shape = broadcast_shape(a->shape, b->shape);
@@ -294,7 +298,7 @@ Var operator-(Var x) {
     return res;
 }
 
-// ReLU
+// ===================== 激活与损失算子 =====================
 Var relu(Var x) {
     bool need_grad = x->requires_grad;
     int n = numel(x->shape);
@@ -317,7 +321,6 @@ Var relu(Var x) {
     return res;
 }
 
-// 逐元素平方
 Var square(Var x) {
     bool need_grad = x->requires_grad;
     int n = numel(x->shape);
@@ -338,7 +341,6 @@ Var square(Var x) {
     return res;
 }
 
-// 求和所有元素
 Var sum(Var x) {
     bool need_grad = x->requires_grad;
     int n = numel(x->shape);
@@ -358,7 +360,99 @@ Var sum(Var x) {
     return res;
 }
 
-// ===================== SGD 优化器 =====================
+// ===================== 矩阵转置 =====================
+Var transpose(Var x) {
+    if (x->shape.size() != 2) throw std::runtime_error("transpose only support 2D");
+    int N = x->shape[0];
+    int K = x->shape[1];
+    std::vector<double> out_data(N * K, 0.0);
+    for (int n = 0; n < N; n++) {
+        for (int k = 0; k < K; k++) {
+            int src = n * K + k;
+            int dst = k * N + n;
+            out_data[dst] = x->data[src];
+        }
+    }
+    Var res = create(out_data, {K, N}, x->requires_grad);
+    res->parents = {x};
+    if (x->requires_grad) {
+        res->grad_fn = [x, res, N, K]() {
+            for (int n = 0; n < N; n++) {
+                for (int k = 0; k < K; k++) {
+                    int src = k * N + n;
+                    int dst = n * K + k;
+                    x->grad[dst] += res->grad[src];
+                }
+            }
+        };
+    }
+    return res;
+}
+
+// ===================== 修复版matmul：无递归，手写三重循环梯度 =====================
+Var matmul(Var A, Var B) {
+    if (A->shape.size() != 2 || B->shape.size() != 2)
+        throw std::runtime_error("matmul only support 2D matrix");
+    int N = A->shape[0];
+    int K = A->shape[1];
+    int K2 = B->shape[0];
+    int M = B->shape[1];
+    if (K != K2) throw std::runtime_error("matmul dim mismatch A.col != B.row");
+
+    bool need_grad = A->requires_grad || B->requires_grad;
+    std::vector<int> out_shape = {N, M};
+    int out_n = N * M;
+    std::vector<double> out_data(out_n, 0.0);
+
+    // 前向
+    for (int n = 0; n < N; n++) {
+        for (int m = 0; m < M; m++) {
+            double s = 0.0;
+            for (int k = 0; k < K; k++) {
+                int offA = n * K + k;
+                int offB = k * M + m;
+                s += A->data[offA] * B->data[offB];
+            }
+            out_data[n * M + m] = s;
+        }
+    }
+
+    Var res = create(out_data, out_shape, need_grad);
+    res->parents = {A, B};
+    if (need_grad) {
+        res->grad_fn = [A, B, res, N, K, M]() {
+            // dA = dout @ B.T
+            for (int n = 0; n < N; n++) {
+                for (int k = 0; k < K; k++) {
+                    double ga = 0.0;
+                    for (int m = 0; m < M; m++) {
+                        int idx_d = n * M + m;
+                        int idx_b = k * M + m;
+                        ga += res->grad[idx_d] * B->data[idx_b];
+                    }
+                    int idx_a = n * K + k;
+                    A->grad[idx_a] += ga;
+                }
+            }
+            // dB = A.T @ dout
+            for (int k = 0; k < K; k++) {
+                for (int m = 0; m < M; m++) {
+                    double gb = 0.0;
+                    for (int n = 0; n < N; n++) {
+                        int idx_d = n * M + m;
+                        int idx_a = n * K + k;
+                        gb += A->data[idx_a] * res->grad[idx_d];
+                    }
+                    int idx_b = k * M + m;
+                    B->grad[idx_b] += gb;
+                }
+            }
+        };
+    }
+    return res;
+}
+
+// ===================== SGD优化器 =====================
 struct SGD {
     double lr;
     std::vector<Var> params;
@@ -400,23 +494,33 @@ private:
     std::vector<std::shared_ptr<Module>> subs;
 };
 
-// 单层线性（仅标量版本，演示用；如需真正矩阵乘需补充matmul）
+// 支持批量输入的Linear层，随机初始化权重
 struct Linear : Module {
     Var w;
     Var b;
-    Linear(int, int) {
-        w = create(0.0, true, true);
-        b = create(0.0, true, true);
+    int in_dim;
+    int out_dim;
+
+    Linear(int in_, int out_) : in_dim(in_), out_dim(out_) {
+        std::vector<double> w_data(in_ * out_);
+        for (auto& v : w_data) v = dist(rng);
+        w = create(w_data, {out_dim, in_dim}, true, true);
+
+        std::vector<double> b_data(out_dim, 0.0);
+        b = create(b_data, {out_dim}, true, true);
     }
+
     Var forward(Var x) override {
-        return w * x + b;
+        Var wx = matmul(x, transpose(w));
+        return wx + b;
     }
+
     std::vector<Var> parameters() override {
         return {w, b};
     }
 };
 
-// 两层网络
+// 两层神经网络
 struct TwoLayerNet : Module {
     std::shared_ptr<Linear> fc1, fc2;
     TwoLayerNet() {
@@ -435,39 +539,38 @@ struct TwoLayerNet : Module {
 
 // ===================== 训练入口 =====================
 int main() {
-    // 数据集 y = 3x + 4
-    std::vector<double> xs = {1, 2, 3, 4, 5};
-    std::vector<double> ys = {7, 10, 13, 16, 19};
+    // 输入批量 shape [5, 1]
+    std::vector<double> xs_data = {1, 2, 3, 4, 5};
+    Var x_batch = create(xs_data, {5, 1}, false);
+    std::vector<double> ys_data = {7, 10, 13, 16, 19};
+    Var y_batch = create(ys_data, {5, 1}, false);
 
     Linear model(1, 1);
     auto params = model.parameters();
-    SGD sgd(0.01, params);
+    SGD sgd(0.01, params); // 调高学习率
 
-    int epochs = 1000;
-    for (int epoch = 0; epoch < epochs; ++epoch) {
+    int epochs = 2000;
+    for (int e = 0; e < epochs; e++) {
         sgd.zero_grad();
-        Var total_loss = create(0.0, false);
-
-        for (int i = 0; i < (int)xs.size(); ++i) {
-            Var x = create(xs[i], false);
-            Var yt = create(ys[i], false);
-            Var yp = model.forward(x);
-            Var loss = square(yp - yt);
-            total_loss = total_loss + loss;
-        }
-        backward(total_loss);
+        Var pred = model.forward(x_batch);
+        Var loss_vec = square(pred - y_batch);
+        Var loss = sum(loss_vec);
+        backward(loss);
         sgd.step();
 
-        if (epoch % 50 == 0) {
-            std::cout << "Epoch " << epoch
-                      << " w=" << model.w->data[0]
-                      << " b=" << model.b->data[0]
-                      << " loss=" << total_loss->data[0] << "\n";
+        if (e % 100 == 0) {
+            double w0 = model.w->data[0];
+            double b0 = model.b->data[0];
+            std::cout << "Epoch " << e
+                      << " w=" << w0
+                      << " b=" << b0
+                      << " loss=" << loss->data[0] << "\n";
         }
     }
-    std::cout << "\nTrain finish:\n";
-    std::cout << "w ≈ " << model.w->data[0] << "\n";
-    std::cout << "b ≈ " << model.b->data[0] << "\n";
-    std::cout << "Target w=3, b=4\n";
+
+    std::cout << "\n==== 训练完成 ====\n";
+    std::cout << "拟合权重 w ≈ " << model.w->data[0] << "\n";
+    std::cout << "拟合偏置 b ≈ " << model.b->data[0] << "\n";
+    std::cout << "理论目标 w=3, b=4\n";
     return 0;
 }
