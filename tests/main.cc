@@ -367,11 +367,12 @@ Var softmax(Var x) {
     bool need_grad = x->requires_grad;
     int n = numel(x->shape);
     std::vector<double> exp_x(n);
+    double max_val = *std::max_element(x->data.begin(), x->data.end());
     double sum_exp = 0.0;
 
-    // 前向：exp(x)
+    // 减去最大值防止exp溢出
     for (int i = 0; i < n; i++) {
-        exp_x[i] = std::exp(x->data[i]);
+        exp_x[i] = std::exp(x->data[i] - max_val);
         sum_exp += exp_x[i];
     }
     std::vector<double> out_data(n);
@@ -383,7 +384,6 @@ Var softmax(Var x) {
     res->parents = {x};
     if (need_grad) {
         res->grad_fn = [x, res, n]() {
-            // dxi = sum_{j} res.grad[j] * res.data[i] * (delta_ij - res.data[j])
             std::vector<double> dx(n, 0.0);
             for (int i = 0; i < n; i++) {
                 double si = res->data[i];
@@ -399,13 +399,35 @@ Var softmax(Var x) {
                 }
                 dx[i] = g;
             }
-            // 梯度累加至输入x
             for (int i = 0; i < n; i++) {
                 x->grad[i] += dx[i];
             }
         };
     }
     return res;
+}
+
+// 输入logits一维向量，target为标量类别索引
+Var cross_entropy(Var logits, int target) {
+    Var s = softmax(logits);
+    double log_s_target = std::log(s->data[target]);
+    Var loss = create(-log_s_target, logits->requires_grad);
+    loss->parents = {s};
+    if (logits->requires_grad) {
+        // 捕获列表加上 loss
+        loss->grad_fn = [logits, s, target, loss]() {
+            int n = numel(s->shape);
+            double dout = loss->grad[0];
+            for (int i = 0; i < n; i++) {
+                double grad = dout * s->data[i];
+                if (i == target) {
+                    grad -= dout;
+                }
+                logits->grad[i] += grad;
+            }
+        };
+    }
+    return loss;
 }
 
 // ===================== 矩阵转置 =====================
